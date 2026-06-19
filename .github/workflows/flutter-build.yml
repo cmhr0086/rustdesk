@@ -9,6 +9,9 @@ on:
       upload-tag:
         type: string
         default: "nightly"
+      build-all-platforms:
+        type: boolean
+        default: false
 
 # NOTE: F-Droid builder script 'flutter/build_fdroid.sh' reads environment
 # variables from this workflow!
@@ -44,14 +47,47 @@ env:
   #signing keys env variable checks
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
   MACOS_P12_BASE64: "${{ secrets.MACOS_P12_BASE64 }}"
+  RS_PUB_KEY: "${{ secrets.RS_PUB_KEY }}"
+  RENDEZVOUS_SERVER: "${{ secrets.RENDEZVOUS_SERVER }}"
+  WINDOWS_SIGNING_PFX: "${{ secrets.WINDOWS_SIGNING_PFX }}"
+  WINDOWS_SIGNING_PASSWORD: "${{ secrets.WINDOWS_SIGNING_PASSWORD }}"
   UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
 
 jobs:
+  validate-custom-build-secrets:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate custom server and signing secrets
+        shell: bash
+        run: |
+          required=(
+            RS_PUB_KEY
+            RENDEZVOUS_SERVER
+            WINDOWS_SIGNING_PFX
+            WINDOWS_SIGNING_PASSWORD
+            ANDROID_SIGNING_KEY
+            ANDROID_ALIAS
+            ANDROID_KEY_STORE_PASSWORD
+            ANDROID_KEY_PASSWORD
+          )
+          for name in "${required[@]}"; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required GitHub Actions secret: ${name}"
+              exit 1
+            fi
+          done
+        env:
+          ANDROID_ALIAS: "${{ secrets.ANDROID_ALIAS }}"
+          ANDROID_KEY_STORE_PASSWORD: "${{ secrets.ANDROID_KEY_STORE_PASSWORD }}"
+          ANDROID_KEY_PASSWORD: "${{ secrets.ANDROID_KEY_PASSWORD }}"
+
   generate-bridge:
+    needs: [validate-custom-build-secrets]
     uses: ./.github/workflows/bridge.yml
 
   build-RustDeskTempTopMostWindow:
+    needs: [validate-custom-build-secrets]
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
     with:
       upload-artifact: ${{ inputs.upload-artifact }}
@@ -64,7 +100,7 @@ jobs:
 
   build-for-windows-flutter:
     name: ${{ matrix.job.target }}
-    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
+    needs: [validate-custom-build-secrets, build-RustDeskTempTopMostWindow, generate-bridge]
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
@@ -233,12 +269,20 @@ jobs:
           name: rustdesk-unsigned-windows-${{ matrix.job.arch }}
           path: rustdesk
 
-      - name: Sign rustdesk files
-        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
-        shell: bash
+      - name: Sign Flutter runtime files with self-signed certificate
+        if: env.UPLOAD_ARTIFACT == 'true'
+        shell: pwsh
         run: |
-          pip3 install requests argparse
-          BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./rustdesk/
+          $pfx = Join-Path $env:RUNNER_TEMP "rustdesk-code-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe was not found" }
+          Get-ChildItem .\rustdesk -Recurse -File -Include *.exe,*.dll | ForEach-Object {
+            & $signtool sign /fd SHA256 /f $pfx /p $env:WINDOWS_SIGNING_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Failed to sign $($_.FullName)" }
+          }
 
       - name: Build self-extracted executable
         shell: bash
@@ -250,7 +294,7 @@ jobs:
           python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
           popd
           mkdir -p ./SignOutput
-          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.exe
+          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-flutter.exe
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
@@ -262,14 +306,24 @@ jobs:
           python preprocess.py --arp -d ../../rustdesk
           nuget restore msi.sln
           msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
-          mv ./Package/bin/x64/Release/en-us/Package.msi ../../SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.msi
+          mv ./Package/bin/x64/Release/en-us/Package.msi ../../SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-flutter.msi
           sha256sum ../../SignOutput/rustdesk-*.msi
 
-      - name: Sign rustdesk self-extracted file
-        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
-        shell: bash
+      - name: Sign Flutter release packages with self-signed certificate
+        if: env.UPLOAD_ARTIFACT == 'true'
+        shell: pwsh
         run: |
-          BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput
+          $pfx = Join-Path $env:RUNNER_TEMP "rustdesk-code-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe was not found" }
+          Get-ChildItem .\SignOutput\* -File -Include *.exe,*.msi | ForEach-Object {
+            & $signtool sign /fd SHA256 /f $pfx /p $env:WINDOWS_SIGNING_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Failed to sign $($_.FullName)" }
+          }
+          Remove-Item $pfx -Force
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
@@ -285,21 +339,19 @@ jobs:
   build-for-windows-sciter:
     name: ${{ matrix.job.target }} (${{ matrix.job.os }})
     runs-on: ${{ matrix.job.os }}
+    needs: [validate-custom-build-secrets]
     # Temporarily disable this action due to additional test is needed.
     # if: false
     strategy:
       fail-fast: false
       matrix:
         job:
-          # - { target: i686-pc-windows-msvc        , os: windows-2022                  }
-          # - { target: x86_64-pc-windows-gnu       , os: windows-2022                  }
           - {
-              target: i686-pc-windows-msvc,
+              target: x86_64-pc-windows-msvc,
               os: windows-2022,
-              arch: x86,
-              vcpkg-triplet: x86-windows-static,
+              arch: x86_64,
+              vcpkg-triplet: x64-windows-static,
             }
-          # - { target: aarch64-pc-windows-msvc, os: windows-2022 }
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
@@ -314,14 +366,14 @@ jobs:
           submodules: recursive
 
       - name: Install LLVM and Clang
-        uses: rustdesk-org/install-llvm-action-32bit@6aa7d9ad3df84dff01cd4596dd0fc880a7f47fce # no release tag; commit 2026-05-26
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
         with:
           version: ${{ env.LLVM_VERSION }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: nightly-2023-10-13-${{ matrix.job.target }} # must use nightly here, because of abi_thiscall feature required
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
           targets: ${{ matrix.job.target }}
           components: "rustfmt"
 
@@ -361,20 +413,14 @@ jobs:
         shell: bash
         run: |
           python3 res/inline-sciter.py
-          # Patch sciter x86
-          sed -i 's/branch = "dyn"/branch = "dyn_x86"/g' ./Cargo.toml
-          cargo update -p sciter-rs --precise 674e07d3066ca9a92ced3816203ab6b652629d1e
           cargo build --locked --features inline,vram,hwcodec --release --bins
           mkdir -p ./Release
           mv ./target/release/rustdesk.exe ./Release/rustdesk.exe
-          curl -LJ -o ./Release/sciter.dll https://github.com/c-smile/sciter-sdk/raw/master/bin.win/x32/sciter.dll
+          curl -LJ -o ./Release/sciter.dll https://github.com/c-smile/sciter-sdk/raw/master/bin.win/x64/sciter.dll
           echo "output_folder=./Release" >> $GITHUB_OUTPUT
           curl -LJ -o ./usbmmidd_v2.zip https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip
           unzip usbmmidd_v2.zip
-          # Do not remove x64 files, because the user may run the 32bit version on a 64bit system.
-          # Do not remove ./usbmmidd_v2/deviceinstaller64.exe, as x86 exe cannot install and uninstall drivers when running on x64,
-          # we need the x64 exe to install and uninstall the driver.
-          rm -rf ./usbmmidd_v2/deviceinstaller.exe ./usbmmidd_v2/usbmmidd.bat
+          rm -rf ./usbmmidd_v2/Win32 ./usbmmidd_v2/deviceinstaller.exe ./usbmmidd_v2/usbmmidd.bat
           mv ./usbmmidd_v2 ./Release || true
 
       - name: find Runner.res
@@ -400,12 +446,20 @@ jobs:
           name: rustdesk-unsigned-windows-${{ matrix.job.arch }}
           path: Release
 
-      - name: Sign rustdesk files
-        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
-        shell: bash
+      - name: Sign Sciter runtime files with self-signed certificate
+        if: env.UPLOAD_ARTIFACT == 'true'
+        shell: pwsh
         run: |
-          pip3 install requests argparse
-          BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./Release/
+          $pfx = Join-Path $env:RUNNER_TEMP "rustdesk-code-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe was not found" }
+          Get-ChildItem .\Release -Recurse -File -Include *.exe,*.dll | ForEach-Object {
+            & $signtool sign /fd SHA256 /f $pfx /p $env:WINDOWS_SIGNING_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Failed to sign $($_.FullName)" }
+          }
 
       - name: Build self-extracted executable
         shell: bash
@@ -418,11 +472,19 @@ jobs:
           mkdir -p ./SignOutput
           mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.exe
 
-      - name: Sign rustdesk self-extracted file
-        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
-        shell: bash
+      - name: Sign Sciter portable package with self-signed certificate
+        if: env.UPLOAD_ARTIFACT == 'true'
+        shell: pwsh
         run: |
-          BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput/
+          $pfx = Join-Path $env:RUNNER_TEMP "rustdesk-code-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe was not found" }
+          & $signtool sign /fd SHA256 /f $pfx /p $env:WINDOWS_SIGNING_PASSWORD /tr http://timestamp.digicert.com /td SHA256 .\SignOutput\rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.exe
+          if ($LASTEXITCODE -ne 0) { throw "Failed to sign Sciter portable package" }
+          Remove-Item $pfx -Force
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
@@ -434,7 +496,7 @@ jobs:
             ./SignOutput/rustdesk-*.exe
 
   build-rustdesk-ios:
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     name: build rustdesk ios ipa
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -554,6 +616,7 @@ jobs:
 
 
   build-for-macOS:
+    if: inputs.build-all-platforms
     name: ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -777,7 +840,7 @@ jobs:
       - build-for-windows-flutter
       - build-for-windows-sciter
     runs-on: ubuntu-latest
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -825,20 +888,6 @@ jobs:
           - {
               arch: aarch64,
               target: aarch64-linux-android,
-              os: ubuntu-24.04,
-              reltype: release,
-              suffix: "",
-            }
-          - {
-              arch: armv7,
-              target: armv7-linux-androideabi,
-              os: ubuntu-24.04,
-              reltype: release,
-              suffix: "",
-            }
-          - {
-              arch: x86_64,
-              target: x86_64-linux-android,
               os: ubuntu-24.04,
               reltype: release,
               suffix: "",
@@ -1109,7 +1158,7 @@ jobs:
   build-rustdesk-android-universal:
     needs: [build-rustdesk-android]
     name: build rustdesk android universal apk
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     runs-on: ubuntu-24.04
     env:
       reltype: release
@@ -1269,7 +1318,7 @@ jobs:
         if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+          name: rustdesk-${{ env.VERSION }}-universal.apk
           path: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
 
       - name: Publish signed apk package
@@ -1291,6 +1340,7 @@ jobs:
             signed-apk/rustdesk-${{ env.VERSION }}-universal${{ env.suffix }}.apk
 
   build-rustdesk-linux:
+    if: inputs.build-all-platforms
     needs: [generate-bridge]
     name: build rustdesk linux ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.on }}
@@ -1628,7 +1678,7 @@ jobs:
             res/rustdesk-${{ env.VERSION }}*.zst
 
   build-rustdesk-linux-sciter:
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     runs-on: ${{ matrix.job.on }}
     name: build-rustdesk-linux-sciter ${{ matrix.job.target }}
     strategy:
@@ -1858,7 +1908,7 @@ jobs:
     name: Build appimage ${{ matrix.job.target }}
     needs: [build-rustdesk-linux]
     runs-on: ubuntu-22.04
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     strategy:
       fail-fast: false
       matrix:
@@ -1910,7 +1960,7 @@ jobs:
       - build-rustdesk-linux
       - build-rustdesk-linux-sciter
     runs-on: ${{ matrix.job.on }}
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     strategy:
       fail-fast: false
       matrix:
@@ -1990,7 +2040,7 @@ jobs:
             flatpak/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak
 
   build-rustdesk-web:
-    if: False
+    if: inputs.build-all-platforms
     name: build-rustdesk-web
     runs-on: ubuntu-22.04
     permissions:

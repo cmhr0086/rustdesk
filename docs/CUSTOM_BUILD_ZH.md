@@ -16,6 +16,9 @@
 
 OSS Server 不需要 `API_SERVER`。更新 Secret 后，必须推送一个新标签重新编译；已经发布或安装的客户端不会自动改变内置服务器。
 
+构建时 `res/custom-build.py` 会在 GitHub Runner 的临时工作区修改官方
+`hbb_common` 配置，并在打包前检查生成的 EXE/Android 动态库确实包含服务器地址和公钥；该临时修改不会提交到子模块。
+
 ## 发布修订版
 
 同一 RustDesk 版本的自定义修订号依次递增，例如：

@@ -205,7 +205,7 @@ jobs:
           python3 .\res\custom-build.py patch
           python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack
           mv ./flutter/build/windows/x64/runner/Release ./rustdesk
-          python3 .\res\custom-build.py verify .\rustdesk\rustdesk.exe
+          python3 .\res\custom-build.py verify .\rustdesk
 
           # Download usbmmidd_v2.zip and extract it to ./rustdesk
           Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip

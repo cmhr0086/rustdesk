@@ -47,12 +47,25 @@ def verify_binaries(paths: list[Path]) -> None:
         "RENDEZVOUS_SERVER": required_env("RENDEZVOUS_SERVER").encode(),
         "RS_PUB_KEY": required_env("RS_PUB_KEY").encode(),
     }
+    files: list[Path] = []
     for path in paths:
+        if path.is_dir():
+            files.extend(item for item in path.rglob("*") if item.is_file())
+        else:
+            files.append(path)
+
+    found: dict[str, Path] = {}
+    for path in files:
         data = path.read_bytes()
-        missing = [name for name, value in expected.items() if value not in data]
-        if missing:
-            raise RuntimeError(f"{path} is missing compiled custom values: {', '.join(missing)}")
-        print(f"Verified compiled custom server configuration in {path}")
+        for name, value in expected.items():
+            if name not in found and value in data:
+                found[name] = path
+
+    missing = [name for name in expected if name not in found]
+    if missing:
+        raise RuntimeError(f"Compiled output is missing custom values: {', '.join(missing)}")
+    locations = ", ".join(f"{name}={path}" for name, path in found.items())
+    print(f"Verified compiled custom server configuration: {locations}")
 
 
 def main() -> None:

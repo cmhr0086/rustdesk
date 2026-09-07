@@ -9,6 +9,9 @@ on:
       upload-tag:
         type: string
         default: "nightly"
+      build-all-platforms:
+        type: boolean
+        default: false
 
 # NOTE: F-Droid builder script 'flutter/build_fdroid.sh' reads environment
 # variables from this workflow!
@@ -27,11 +30,6 @@ env:
   LLVM_VERSION: "15.0.6"
   FLUTTER_VERSION: "3.24.5"
   ANDROID_FLUTTER_VERSION: "3.24.5"
-  # Windows arm64 only: the first stable Flutter to ship a native arm64 Windows Dart SDK +
-  # engine is 3.44. Every other platform stays on FLUTTER_VERSION (3.24.5) until Windows 7
-  # support is restored after the upstream-wide Flutter bump. The arm64 job patches the few
-  # 3.44-only source/pubspec changes on the fly (see "Patch RustDesk sources for Flutter 3.44").
-  FLUTTER_WINDOWS_ARM_VERSION: "3.44.0"
   # for arm64 linux because official Dart SDK does not work
   FLUTTER_ELINUX_VERSION: "3.16.9"
   TAG_NAME: "${{ inputs.upload-tag }}"
@@ -49,37 +47,60 @@ env:
   #signing keys env variable checks
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
   MACOS_P12_BASE64: "${{ secrets.MACOS_P12_BASE64 }}"
+  RS_PUB_KEY: "${{ secrets.RS_PUB_KEY }}"
+  RENDEZVOUS_SERVER: "${{ secrets.RENDEZVOUS_SERVER }}"
+  WINDOWS_SIGNING_PFX: "${{ secrets.WINDOWS_SIGNING_PFX }}"
+  WINDOWS_SIGNING_PASSWORD: "${{ secrets.WINDOWS_SIGNING_PASSWORD }}"
   UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
 
 jobs:
+  validate-custom-build-secrets:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate custom server and signing secrets
+        shell: bash
+        run: |
+          required=(
+            RS_PUB_KEY
+            RENDEZVOUS_SERVER
+            WINDOWS_SIGNING_PFX
+            WINDOWS_SIGNING_PASSWORD
+            ANDROID_SIGNING_KEY
+            ANDROID_ALIAS
+            ANDROID_KEY_STORE_PASSWORD
+            ANDROID_KEY_PASSWORD
+          )
+          for name in "${required[@]}"; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required GitHub Actions secret: ${name}"
+              exit 1
+            fi
+          done
+        env:
+          ANDROID_ALIAS: "${{ secrets.ANDROID_ALIAS }}"
+          ANDROID_KEY_STORE_PASSWORD: "${{ secrets.ANDROID_KEY_STORE_PASSWORD }}"
+          ANDROID_KEY_PASSWORD: "${{ secrets.ANDROID_KEY_PASSWORD }}"
+
   generate-bridge:
+    needs: [validate-custom-build-secrets]
     uses: ./.github/workflows/bridge.yml
 
   build-RustDeskTempTopMostWindow:
+    needs: [validate-custom-build-secrets]
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
-    strategy:
-      fail-fast: false
-      matrix:
-        job:
-          - {
-              target: windows-2022,
-              platform: x64,
-            }
-          - {
-              target: windows-11-arm,
-              platform: ARM64,
-            }
     with:
       upload-artifact: ${{ inputs.upload-artifact }}
-      target: ${{ matrix.job.target }}
+      target: windows-2022
       configuration: Release
-      platform: ${{ matrix.job.platform }}
+      platform: x64
       target_version: Windows10
+    strategy:
+      fail-fast: false
 
   build-for-windows-flutter:
     name: ${{ matrix.job.target }}
-    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
+    needs: [validate-custom-build-secrets, build-RustDeskTempTopMostWindow, generate-bridge]
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
@@ -91,20 +112,9 @@ jobs:
               target: x86_64-pc-windows-msvc,
               os: windows-2022,
               arch: x86_64,
-              flutter-arch: x64,
               vcpkg-triplet: x64-windows-static,
-              build-args: "--vram",
             }
-          - {
-              target: aarch64-pc-windows-msvc,
-              os: windows-11-arm,
-              arch: aarch64,
-              flutter-arch: arm64,
-              vcpkg-triplet: arm64-windows-static,
-              # vram is x86/x64-only (NVENC needs CUDA, Intel MediaSDK needs __rdtsc);
-              # no NV/Intel/AMD hardware exists on Windows-on-ARM, so vram stays disabled here.
-              build-args: "",
-            }
+          # - { target: aarch64-pc-windows-msvc, os: windows-2022, arch: aarch64 }
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
@@ -121,90 +131,35 @@ jobs:
       - name: Restore bridge files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          # arm64 is on Flutter 3.44, so it needs the bridge generated with the same Flutter
-          # (its *.freezed.dart must match the freezed the arm64 build resolves). x64 and every
-          # other platform keep the default 3.22.3-generated bridge.
-          name: ${{ matrix.job.arch == 'aarch64' && 'bridge-artifact-flutter-3.44' || 'bridge-artifact' }}
+          name: bridge-artifact
           path: ./
 
       - name: Install LLVM and Clang
-        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        uses: KyleMayes/install-llvm-action@1a3da29f56261a1e1f937ec88f0856a9b8321d7e # v1
         with:
           version: ${{ env.LLVM_VERSION }}
 
       - name: Install flutter
-        id: flutter
-        # arm64 builds with FLUTTER_WINDOWS_ARM_VERSION (>=3.44); x64 stays on FLUTTER_VERSION.
-        # subosito only ships an x64 Windows SDK (Flutter's release manifest lists x64 only),
-        # so it installs x64 on both arches. The arm64 runner re-bootstraps Dart to arm64 in
-        # the next step.
         uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225  # v2.12.0; https://github.com/subosito/flutter-action/issues/277
         with:
           channel: "stable"
-          flutter-version: ${{ matrix.job.arch == 'aarch64' && env.FLUTTER_WINDOWS_ARM_VERSION || env.FLUTTER_VERSION }}
-          architecture: x64
-
-      - name: Force arm64 Dart SDK + engine
-        # The x64 SDK subosito installs bundles an x64 Dart with a matching engine-dart-sdk.stamp,
-        # so update_dart_sdk.ps1 short-circuits (stamp matches -> return) and keeps x64 Dart;
-        # `flutter build windows` then targets the Dart VM's arch = x64, even on this arm64 host.
-        # On this native-arm64 runner (PROCESSOR_ARCHITECTURE=ARM64), deleting the stamp and
-        # re-running update_dart_sdk.ps1 pulls the arm64 Dart (available since Flutter 3.44.0).
-        # https://github.com/flutter/flutter/issues/186730#issuecomment-4573214964
-        if: ${{ matrix.job.arch == 'aarch64' }}
-        run: |
-          $flutterRoot = "${{ steps.flutter.outputs['CACHE-PATH'] }}"
-          Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
-          Write-Host "Flutter root: $flutterRoot"
-          Remove-Item -Force "$flutterRoot\bin\cache\engine-dart-sdk.stamp" -ErrorAction SilentlyContinue
-          & "$flutterRoot\bin\internal\update_dart_sdk.ps1"
-          # Confirm the Dart we ended up with is arm64 ("on windows_arm64"); fail loudly if not.
-          $dartVer = & "$flutterRoot\bin\dart.bat" --version 2>&1 | Out-String
-          Write-Host $dartVer
-          if ($dartVer -notmatch "windows_arm64") {
-            Write-Error "Expected an arm64 Dart SDK but got: $dartVer"
-            exit 1
-          }
-          & "$flutterRoot\bin\flutter.bat" precache --windows
-          # Fail fast if precache pulled the wrong-arch Windows engine: an arm64 Dart should
-          # fetch windows-arm64 engine artifacts. Bailing here saves the ~25min Rust build.
-          $engineDir = "$flutterRoot\bin\cache\artifacts\engine"
-          Write-Host "Engine artifacts present:"
-          Get-ChildItem $engineDir -Directory | Select-Object -ExpandProperty Name | Write-Host
-          if (-not (Test-Path "$engineDir\windows-arm64-release")) {
-            Write-Error "Expected windows-arm64-release engine artifacts but they are missing (wrong-arch SDK)."
-            exit 1
-          }
+          flutter-version: ${{ env.FLUTTER_VERSION }}
 
       # https://github.com/flutter/flutter/issues/155685
-      # x64 only: arm64 uses the stock native arm64 Windows engine, and the rustdesk/engine
-      # windows-x64-release.zip is built for the 3.24-era x64 engine (matches FLUTTER_VERSION).
       - name: Replace engine with rustdesk custom flutter engine
-        if: ${{ matrix.job.arch == 'x86_64' }}
         run: |
           flutter doctor -v
           flutter precache --windows
           Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
           Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
-          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
 
       - name: Patch flutter
-        # x64 stays on Flutter 3.24.5, which needs the dropdown filter patch.
-        # arm64 is on Flutter 3.44 (patched separately below) and does not use this patch.
-        if: ${{ matrix.job.arch == 'x86_64' }}
         shell: bash
         run: |
           cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
           cd $(dirname $(dirname $(which flutter)))
           [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]] && git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
-
-      - name: Patch RustDesk sources for Flutter 3.44 (arm64)
-        # arm64 is the only target on Flutter 3.44; apply its source/pubspec deltas on the fly
-        # (shared with the 3.44 bridge job) so the committed sources stay on Flutter 3.24.5.
-        # `flutter build` then runs `pub get`, regenerating pubspec.lock for the bumped deps.
-        if: ${{ matrix.job.arch == 'aarch64' }}
-        shell: bash
-        run: bash .github/patches/apply_flutter_3.44_source_patches.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -244,19 +199,13 @@ jobs:
           head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
         shell: bash
 
-      - name: Set SODIUM_LIB_DIR (arm64)
-        # libsodium-sys ships no arm64 Windows prebuilt lib; point it at the vcpkg-built one
-        # (only for arm64 — leaving it unset lets x64 use the crate's bundled lib).
-        if: ${{ matrix.job.arch == 'aarch64' }}
-        shell: bash
-        run: echo "SODIUM_LIB_DIR=$VCPKG_ROOT/installed/${{ matrix.job.vcpkg-triplet }}/lib" >> "$GITHUB_ENV"
-
       - name: Build rustdesk
         run: |
           # Windows: build RustDesk
-          # --hwcodec is shared by all Windows targets; per-target extras (e.g. --vram) come from the matrix
-          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }}
-          mv ./flutter/build/windows/${{ matrix.job.flutter-arch }}/runner/Release ./rustdesk
+          python3 .\res\custom-build.py patch
+          python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+          python3 .\res\custom-build.py verify .\rustdesk
 
           # Download usbmmidd_v2.zip and extract it to ./rustdesk
           Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
@@ -312,7 +261,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ inputs.upload-artifact }}
         with:
-          name: ${{ matrix.job.arch == 'aarch64' && 'topmostwindow-artifacts-ARM64' || 'topmostwindow-artifacts-x64' }}
+          name: topmostwindow-artifacts-x64
           path: "./rustdesk"
 
       - name: Upload unsigned
@@ -322,12 +271,20 @@ jobs:
           name: rustdesk-unsigned-windows-${{ matrix.job.arch }}
           path: rustdesk
 
-      - name: Sign rustdesk files
-        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
-        shell: bash
+      - name: Sign Flutter runtime files with self-signed certificate
+        if: env.UPLOAD_ARTIFACT == 'true'
+        shell: pwsh
         run: |
-          pip3 install requests argparse
-          BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./rustdesk/
+          $pfx = Join-Path $env:RUNNER_TEMP "rustdesk-code-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe was not found" }
+          Get-ChildItem .\rustdesk -Recurse -File -Include *.exe,*.dll | ForEach-Object {
+            & $signtool sign /fd SHA256 /f $pfx /p $env:WINDOWS_SIGNING_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Failed to sign $($_.FullName)" }
+          }
 
       - name: Build self-extracted executable
         shell: bash
@@ -339,31 +296,36 @@ jobs:
           python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
           popd
           mkdir -p ./SignOutput
-          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.exe
+          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-flutter.exe
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
 
       - name: Build msi
-        # Builds the MSI for the matrix arch. res/msi (WiX v4 + native CustomActions) carries
-        # both x64 and ARM64 platform configs; WcaUtil/DUtil ship arm64 libs. msbuild platform
-        # is x64 / ARM64; the produced Package.msi is globbed since its bin/<platform>/ dir varies.
         if: env.UPLOAD_ARTIFACT == 'true'
         run: |
           pushd ./res/msi
           python preprocess.py --arp -d ../../rustdesk
           nuget restore msi.sln
-          $msiPlatform = if ('${{ matrix.job.arch }}' -eq 'aarch64') { 'ARM64' } else { 'x64' }
-          msbuild msi.sln -p:Configuration=Release -p:Platform=$msiPlatform /p:TargetVersion=Windows10
-          $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
-          mv $msi.FullName ../../SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.msi
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+          mv ./Package/bin/x64/Release/en-us/Package.msi ../../SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-flutter.msi
           sha256sum ../../SignOutput/rustdesk-*.msi
 
-      - name: Sign rustdesk self-extracted file
-        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
-        shell: bash
+      - name: Sign Flutter release packages with self-signed certificate
+        if: env.UPLOAD_ARTIFACT == 'true'
+        shell: pwsh
         run: |
-          BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput
+          $pfx = Join-Path $env:RUNNER_TEMP "rustdesk-code-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe was not found" }
+          Get-ChildItem .\SignOutput\* -File -Include *.exe,*.msi | ForEach-Object {
+            & $signtool sign /fd SHA256 /f $pfx /p $env:WINDOWS_SIGNING_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Failed to sign $($_.FullName)" }
+          }
+          Remove-Item $pfx -Force
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
@@ -379,21 +341,19 @@ jobs:
   build-for-windows-sciter:
     name: ${{ matrix.job.target }} (${{ matrix.job.os }})
     runs-on: ${{ matrix.job.os }}
+    needs: [validate-custom-build-secrets]
     # Temporarily disable this action due to additional test is needed.
     # if: false
     strategy:
       fail-fast: false
       matrix:
         job:
-          # - { target: i686-pc-windows-msvc        , os: windows-2022                  }
-          # - { target: x86_64-pc-windows-gnu       , os: windows-2022                  }
           - {
-              target: i686-pc-windows-msvc,
+              target: x86_64-pc-windows-msvc,
               os: windows-2022,
-              arch: x86,
-              vcpkg-triplet: x86-windows-static,
+              arch: x86_64,
+              vcpkg-triplet: x64-windows-static,
             }
-          # - { target: aarch64-pc-windows-msvc, os: windows-2022 }
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
@@ -408,14 +368,14 @@ jobs:
           submodules: recursive
 
       - name: Install LLVM and Clang
-        uses: rustdesk-org/install-llvm-action-32bit@6aa7d9ad3df84dff01cd4596dd0fc880a7f47fce # no release tag; commit 2026-05-26
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
         with:
           version: ${{ env.LLVM_VERSION }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: nightly-2023-10-13-${{ matrix.job.target }} # must use nightly here, because of abi_thiscall feature required
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
           targets: ${{ matrix.job.target }}
           components: "rustfmt"
 
@@ -454,21 +414,17 @@ jobs:
         id: build
         shell: bash
         run: |
+          python3 res/custom-build.py patch
           python3 res/inline-sciter.py
-          # Patch sciter x86
-          sed -i 's/branch = "dyn"/branch = "dyn_x86"/g' ./Cargo.toml
-          cargo update -p sciter-rs --precise 674e07d3066ca9a92ced3816203ab6b652629d1e
           cargo build --locked --features inline,vram,hwcodec --release --bins
           mkdir -p ./Release
           mv ./target/release/rustdesk.exe ./Release/rustdesk.exe
-          curl -LJ -o ./Release/sciter.dll https://github.com/c-smile/sciter-sdk/raw/master/bin.win/x32/sciter.dll
+          python3 res/custom-build.py verify ./Release/rustdesk.exe
+          curl -LJ -o ./Release/sciter.dll https://github.com/c-smile/sciter-sdk/raw/master/bin.win/x64/sciter.dll
           echo "output_folder=./Release" >> $GITHUB_OUTPUT
           curl -LJ -o ./usbmmidd_v2.zip https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip
           unzip usbmmidd_v2.zip
-          # Do not remove x64 files, because the user may run the 32bit version on a 64bit system.
-          # Do not remove ./usbmmidd_v2/deviceinstaller64.exe, as x86 exe cannot install and uninstall drivers when running on x64,
-          # we need the x64 exe to install and uninstall the driver.
-          rm -rf ./usbmmidd_v2/deviceinstaller.exe ./usbmmidd_v2/usbmmidd.bat
+          rm -rf ./usbmmidd_v2/Win32 ./usbmmidd_v2/deviceinstaller.exe ./usbmmidd_v2/usbmmidd.bat
           mv ./usbmmidd_v2 ./Release || true
 
       - name: find Runner.res
@@ -494,12 +450,20 @@ jobs:
           name: rustdesk-unsigned-windows-${{ matrix.job.arch }}
           path: Release
 
-      - name: Sign rustdesk files
-        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
-        shell: bash
+      - name: Sign Sciter runtime files with self-signed certificate
+        if: env.UPLOAD_ARTIFACT == 'true'
+        shell: pwsh
         run: |
-          pip3 install requests argparse
-          BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./Release/
+          $pfx = Join-Path $env:RUNNER_TEMP "rustdesk-code-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe was not found" }
+          Get-ChildItem .\Release -Recurse -File -Include *.exe,*.dll | ForEach-Object {
+            & $signtool sign /fd SHA256 /f $pfx /p $env:WINDOWS_SIGNING_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Failed to sign $($_.FullName)" }
+          }
 
       - name: Build self-extracted executable
         shell: bash
@@ -512,11 +476,19 @@ jobs:
           mkdir -p ./SignOutput
           mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.exe
 
-      - name: Sign rustdesk self-extracted file
-        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
-        shell: bash
+      - name: Sign Sciter portable package with self-signed certificate
+        if: env.UPLOAD_ARTIFACT == 'true'
+        shell: pwsh
         run: |
-          BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput/
+          $pfx = Join-Path $env:RUNNER_TEMP "rustdesk-code-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe was not found" }
+          & $signtool sign /fd SHA256 /f $pfx /p $env:WINDOWS_SIGNING_PASSWORD /tr http://timestamp.digicert.com /td SHA256 .\SignOutput\rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.exe
+          if ($LASTEXITCODE -ne 0) { throw "Failed to sign Sciter portable package" }
+          Remove-Item $pfx -Force
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
@@ -528,7 +500,7 @@ jobs:
             ./SignOutput/rustdesk-*.exe
 
   build-rustdesk-ios:
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     name: build rustdesk ios ipa
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -648,6 +620,7 @@ jobs:
 
 
   build-for-macOS:
+    if: inputs.build-all-platforms
     name: ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -871,7 +844,7 @@ jobs:
       - build-for-windows-flutter
       - build-for-windows-sciter
     runs-on: ubuntu-latest
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -919,20 +892,6 @@ jobs:
           - {
               arch: aarch64,
               target: aarch64-linux-android,
-              os: ubuntu-24.04,
-              reltype: release,
-              suffix: "",
-            }
-          - {
-              arch: armv7,
-              target: armv7-linux-androideabi,
-              os: ubuntu-24.04,
-              reltype: release,
-              suffix: "",
-            }
-          - {
-              arch: x86_64,
-              target: x86_64-linux-android,
               os: ubuntu-24.04,
               reltype: release,
               suffix: "",
@@ -1070,6 +1029,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          python3 ./res/custom-build.py patch
           rustup target add ${{ matrix.job.target }}
           cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
           case ${{ matrix.job.target }} in
@@ -1094,6 +1054,7 @@ jobs:
               cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86/librustdesk.so
             ;;
           esac
+          python3 ./res/custom-build.py verify ./target/${{ matrix.job.target }}/release/liblibrustdesk.so
 
       - name: Upload Rustdesk library to Artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1203,7 +1164,7 @@ jobs:
   build-rustdesk-android-universal:
     needs: [build-rustdesk-android]
     name: build rustdesk android universal apk
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     runs-on: ubuntu-24.04
     env:
       reltype: release
@@ -1363,7 +1324,7 @@ jobs:
         if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+          name: rustdesk-${{ env.VERSION }}-universal.apk
           path: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
 
       - name: Publish signed apk package
@@ -1385,6 +1346,7 @@ jobs:
             signed-apk/rustdesk-${{ env.VERSION }}-universal${{ env.suffix }}.apk
 
   build-rustdesk-linux:
+    if: inputs.build-all-platforms
     needs: [generate-bridge]
     name: build rustdesk linux ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.on }}
@@ -1722,7 +1684,7 @@ jobs:
             res/rustdesk-${{ env.VERSION }}*.zst
 
   build-rustdesk-linux-sciter:
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     runs-on: ${{ matrix.job.on }}
     name: build-rustdesk-linux-sciter ${{ matrix.job.target }}
     strategy:
@@ -1952,7 +1914,7 @@ jobs:
     name: Build appimage ${{ matrix.job.target }}
     needs: [build-rustdesk-linux]
     runs-on: ubuntu-22.04
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     strategy:
       fail-fast: false
       matrix:
@@ -1984,7 +1946,6 @@ jobs:
           sudo apt-get install -y libarchive-tools libfuse2
           # set-up appimage-builder
           # https://github.com/AppImage/AppImageKit/issues/1395
-          sudo pip3 install "setuptools_scm<10"
           sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
           # run appimage-builder
           pushd appimage
@@ -2005,7 +1966,7 @@ jobs:
       - build-rustdesk-linux
       - build-rustdesk-linux-sciter
     runs-on: ${{ matrix.job.on }}
-    if: ${{ inputs.upload-artifact }}
+    if: inputs.build-all-platforms
     strategy:
       fail-fast: false
       matrix:
@@ -2085,7 +2046,7 @@ jobs:
             flatpak/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak
 
   build-rustdesk-web:
-    if: False
+    if: inputs.build-all-platforms
     name: build-rustdesk-web
     runs-on: ubuntu-22.04
     permissions:

@@ -1,0 +1,70 @@
+name: Sync Upstream Release
+
+# Replays our own commits (everything on `custom` that no upstream tag
+# contains) onto the latest upstream release, then pushes `<tag>-N`, which
+# starts flutter-tag.yml. Needs secret SYNC_TOKEN: a PAT with `repo` and
+# `workflow` scopes, since the rebased branch carries upstream workflow
+# changes that GITHUB_TOKEN may not push, and its pushes start no workflows.
+
+on:
+  schedule:
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to rebase onto (default: latest release)"
+        required: false
+      rebuild:
+        description: "Push a new build tag even if already up to date"
+        type: boolean
+        default: false
+
+concurrency: sync-upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: custom
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Rebase onto upstream release
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REBUILD: ${{ inputs.rebuild }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          tag="${INPUT_TAG:-$(gh release view -R rustdesk/rustdesk --json tagName -q .tagName)}"
+          echo "Upstream tag: $tag"
+          git remote add upstream https://github.com/rustdesk/rustdesk.git
+          git fetch --no-tags upstream "+refs/tags/*:refs/upstream-tags/*"
+          base="refs/upstream-tags/$tag"
+          git rev-parse --verify -q "$base^{commit}" >/dev/null || { echo "::error::No upstream tag $tag"; exit 1; }
+
+          if git merge-base --is-ancestor "$base" HEAD; then
+            echo "custom already contains $tag"
+            [ "$REBUILD" = "true" ] || exit 0
+          else
+            ours=$(git rev-list --reverse --no-merges HEAD --not $(git for-each-ref --format='%(objectname)' refs/upstream-tags/))
+            echo "Replaying:"; git log --oneline --no-walk $ours
+            git checkout -q --detach "$base"
+            if ! git cherry-pick $ours; then
+              git status --short
+              echo "::error::Our commits conflict with upstream $tag. Rebase custom by hand: git rebase --onto $tag <old-tag> custom"
+              exit 1
+            fi
+            git push --force-with-lease=custom origin HEAD:refs/heads/custom
+          fi
+
+          n=1
+          while git ls-remote --exit-code --tags origin "refs/tags/$tag-$n" >/dev/null; do n=$((n + 1)); done
+          git tag "$tag-$n"
+          git push origin "refs/tags/$tag-$n"
+          echo "Pushed build tag $tag-$n" >> "$GITHUB_STEP_SUMMARY"

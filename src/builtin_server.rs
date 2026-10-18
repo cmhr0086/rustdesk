@@ -8,11 +8,11 @@ use base::config::keys;
 use hbb_common::config;
 
 /// hbbs, `host[:port]`
-const RENDEZVOUS_SERVER: &str = "";
+const RENDEZVOUS_SERVER: &str = "rust.vmnox.com";
 /// Content of hbbs `id_ed25519.pub`
 const RS_PUB_KEY: &str = "F9ZWfKQo668K+NF2fYbVZXs3hbc2plJbLWF8DOjYxqc=";
 /// hbbr, `host[:port]`; empty means whatever hbbs hands out
-const RELAY_SERVER: &str = "";
+const RELAY_SERVER: &str = "rust.vmnox.com:21117";
 /// `http(s)://host[:port]`, only needed for an API server
 const API_SERVER: &str = "";
 

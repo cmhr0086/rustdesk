@@ -3,7 +3,8 @@ name: Sign Windows Release
 # After Flutter Tag Build publishes a release, signs its Windows .exe/.msi
 # with secrets WINDOWS_SIGNING_PFX (base64 of the .pfx) and
 # WINDOWS_SIGNING_PASSWORD, then replaces the release assets. Only the
-# installers are signed; files inside them stay as built.
+# installers are signed; files inside them stay as built. Finally marks the
+# release as the latest full release (upstream publishes it as prerelease).
 
 on:
   workflow_run:
@@ -74,3 +75,9 @@ jobs:
 
           gh release upload $env:TAG @($files.FullName) --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+
+      - name: Publish as latest release
+        shell: pwsh
+        run: |
+          gh release edit $env:TAG --prerelease=false --latest
+          if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }

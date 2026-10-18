@@ -1,0 +1,76 @@
+name: Sign Windows Release
+
+# After Flutter Tag Build publishes a release, signs its Windows .exe/.msi
+# with secrets WINDOWS_SIGNING_PFX (base64 of the .pfx) and
+# WINDOWS_SIGNING_PASSWORD, then replaces the release assets. Only the
+# installers are signed; files inside them stay as built.
+
+on:
+  workflow_run:
+    workflows: ["Flutter Tag Build"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to sign, e.g. 1.5.0-1"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency: sign-windows-${{ inputs.tag || github.event.workflow_run.head_branch }}
+
+jobs:
+  sign:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+      WINDOWS_SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX }}
+      WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+    steps:
+      - name: Sign and replace assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:WINDOWS_SIGNING_PFX) {
+            Write-Host "::warning::WINDOWS_SIGNING_PFX is not set, nothing signed"
+            exit 0
+          }
+          Write-Host "Release: $env:TAG"
+
+          $dir = Join-Path $env:RUNNER_TEMP "assets"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          gh release download $env:TAG --dir $dir --pattern "*.exe" --pattern "*.msi" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
+          $files = Get-ChildItem $dir -File
+          if (-not $files) {
+            Write-Host "::warning::No .exe/.msi in release $env:TAG"
+            exit 0
+          }
+
+          $pfx = Join-Path $env:RUNNER_TEMP "code-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
+          try {
+            $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+              Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if (-not $signtool) { throw "signtool.exe was not found" }
+            foreach ($f in $files) {
+              & $signtool.FullName sign /fd SHA256 /f $pfx /p $env:WINDOWS_SIGNING_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $f.FullName
+              if ($LASTEXITCODE -ne 0) { throw "signtool failed on $($f.Name)" }
+            }
+          } finally {
+            Remove-Item $pfx -Force
+          }
+
+          foreach ($f in $files) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            if (-not $sig.SignerCertificate) { throw "$($f.Name) has no signature after signing" }
+            "| $($f.Name) | $($sig.SignerCertificate.Subject) | $($sig.Status) |" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          }
+
+          gh release upload $env:TAG @($files.FullName) --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }

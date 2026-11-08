@@ -16,7 +16,20 @@ const RELAY_SERVER: &str = "rust.vmnox.com:21117";
 /// `http(s)://host[:port]`, only needed for an API server
 const API_SERVER: &str = "";
 
+/// Official updates are stock builds that would drop the settings above.
+fn disable_update_check() {
+    config::OVERWRITE_LOCAL_SETTINGS
+        .write()
+        .unwrap()
+        .insert(keys::OPTION_ENABLE_CHECK_UPDATE.to_owned(), "N".to_owned());
+    config::OVERWRITE_SETTINGS
+        .write()
+        .unwrap()
+        .insert(keys::OPTION_ALLOW_AUTO_UPDATE.to_owned(), "N".to_owned());
+}
+
 pub fn apply() {
+    disable_update_check();
     if RENDEZVOUS_SERVER.is_empty() {
         return;
     }

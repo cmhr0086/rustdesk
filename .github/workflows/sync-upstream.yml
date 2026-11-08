@@ -7,6 +7,9 @@ name: Sync Upstream Release
 # changes that GITHUB_TOKEN may not push, and its pushes start no workflows.
 
 on:
+  schedule:
+    # cron cannot express "every 14 days"; the 1st and 15th come close.
+    - cron: "0 0 1,15 * *"
   workflow_dispatch:
     inputs:
       tag:

@@ -31,7 +31,6 @@ fn disable_update_check() {
 fn apply_ui_options() {
     let mut builtin = config::BUILTIN_SETTINGS.write().unwrap();
     for k in [
-        keys::OPTION_HIDE_HELP_CARDS,
         keys::OPTION_HIDE_NETWORK_SETTINGS,
         keys::OPTION_HIDE_PROXY_SETTINGS,
         keys::OPTION_HIDE_WEBSOCKET_SETTINGS,

@@ -23,15 +23,34 @@ concurrency: sign-windows-${{ inputs.tag || github.event.workflow_run.head_branc
 
 jobs:
   sign:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # A cancelled or failed build still counts when the Windows x64 job
+    # succeeded, so one broken platform (e.g. a retired macOS runner) doesn't
+    # block signing. The first step checks that.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(fromJSON('["success", "failure", "cancelled"]'), github.event.workflow_run.conclusion)
     runs-on: windows-latest
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
       WINDOWS_SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX }}
       WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
     steps:
+      - name: Check Windows build
+        if: github.event_name == 'workflow_run'
+        shell: pwsh
+        run: |
+          $jobs = gh run view $env:RUN_ID --json jobs | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "gh run view failed" }
+          $win = $jobs.jobs | Where-Object { $_.name -like "*/ x86_64-pc-windows-msvc" }
+          if (-not $win -or $win.conclusion -ne "success") {
+            throw "Windows x64 build did not succeed in run $env:RUN_ID, not signing"
+          }
+          $bad = $jobs.jobs | Where-Object { $_.conclusion -notin "success", "skipped" } | ForEach-Object name
+          if ($bad) { Write-Host "::warning::Signing anyway; these jobs did not succeed: $($bad -join ', ')" }
+
       - name: Sign and replace assets
         shell: pwsh
         run: |

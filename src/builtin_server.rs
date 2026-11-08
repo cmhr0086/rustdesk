@@ -28,7 +28,30 @@ fn disable_update_check() {
         .insert(keys::OPTION_ALLOW_AUTO_UPDATE.to_owned(), "N".to_owned());
 }
 
+fn apply_ui_options() {
+    let mut builtin = config::BUILTIN_SETTINGS.write().unwrap();
+    for k in [
+        keys::OPTION_HIDE_HELP_CARDS,
+        keys::OPTION_HIDE_NETWORK_SETTINGS,
+        keys::OPTION_HIDE_PROXY_SETTINGS,
+        keys::OPTION_HIDE_WEBSOCKET_SETTINGS,
+    ] {
+        builtin.insert(k.to_owned(), "Y".to_owned());
+    }
+    drop(builtin);
+    let mut hard = config::HARD_SETTINGS.write().unwrap();
+    for k in ["disable-account", "disable-ab"] {
+        hard.insert(k.to_owned(), "Y".to_owned());
+    }
+    drop(hard);
+    config::OVERWRITE_SETTINGS.write().unwrap().insert(
+        keys::OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION.to_owned(),
+        "Y".to_owned(),
+    );
+}
+
 pub fn apply() {
+    apply_ui_options();
     disable_update_check();
     if RENDEZVOUS_SERVER.is_empty() {
         return;
